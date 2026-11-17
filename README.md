@@ -41,14 +41,37 @@ docker compose up -d --build
 | --- | --- | --- |
 | `POST` | `/jobs` | 提交 `{"features": [[...]], "labels": [...], "epochs": 3}`，返回 201 与任务 |
 | `GET` | `/jobs` | 最近任务列表 |
-| `GET` | `/jobs/{job_id}` | 已确认步数、进度、损失、当前权重；完成时含 `final_weights` |
+| `GET` | `/jobs/{job_id}` | 已确认步数、进度、损失、当前权重；完成时含 `final_weights`；另含建单时保存的原始样本各列均值/标准差 `feature_means`/`feature_stds` |
 | `GET` | `/jobs/{job_id}/checkpoints` | 全部批次断点（可按 `after_step` 增量拉取） |
 | `GET` | `/jobs/{job_id}/events` | 审计事件：创建、开始/从第几步续训、完成、丢失租约 |
 | `GET` | `/workers` | 工作器心跳与租约持有者 |
+| `POST` | `/monitor/baseline` | 把某个**已完成且带原始样本统计量**的任务设为漂移监测基准 |
+| `GET` | `/monitor/status` | 当前基准与未满窗口的填充进度 |
+| `POST` | `/monitor/readings` | 逐条上报原始测值；满 16 条的窗口若越限则返回告警列、偏移量与基准任务号 |
+| `GET` | `/monitor/windows` | 已评估窗口的结论（每条结论固定指向其评估时使用的基准） |
 | `GET` | `/health` | 健康检查 |
 
 `Swagger`（`/docs`）里直接 `POST /jobs` 提交即可看到训练开始；`GET /jobs/{id}` 与
 `GET /jobs/{id}/checkpoints` 查看进度与每个断点的权重/动量/损失。
+
+## 输入漂移监测
+
+值班员持续上报现场振动/电流测值，平台判断输入是否偏离训练样本，以决定何时重新采样：
+
+1. **基准**：新训练任务在建单时保存原始（未标准化）样本各列的均值与标准差。只有
+   `completed` 且统计量齐备的任务才能设为基准；此功能上线前创建的旧任务没有统计量，
+   设置时返回 `409`——标准化后的样本无法还原原始量纲，平台直接拒绝而不猜测。
+2. **窗口**：测值按原始值逐条上报（一次请求可携带多条），每 16 条构成一个不重叠
+   窗口。窗口满时用其绑定的基准评估：任一列 `|窗口均值 − 基准均值| > 2 × 基准标准差`
+   即告警；基准的常量列（标准差≈0）在窗口内出现不同测值也告警。响应按窗口给出
+   告警列、偏移量与基准任务号。
+3. **幂等**：每次上报携带客户端幂等键 `report_id`；重试（即使内容不同）返回首次
+   结果并标 `duplicate: true`，不会重复计数。
+4. **切换基准**：窗口在第一条测值进入时绑定当前基准。切换到新基准会作废未满窗口
+   （响应里的 `dropped_readings`），旧窗口的测值绝不混入新基准评估；已评估窗口的
+   结论永久保存于 `/monitor/windows`，仍指向原基准。重复设置同一基准不影响未满窗口。
+5. **重启**：基准与未满窗口（条数、列和、常量列违规）全部持久化在共享 SQLite 中，
+   API 重启后接着累积。
 
 ## 续跑与防回退机制
 
@@ -98,14 +121,15 @@ python3 -m pytest -q
 ## 目录
 
 ```
-app/main.py       API 与 Swagger
+app/main.py       API 与 Swagger（训练 + 漂移监测）
 app/worker.py     工作器主循环、租约续训
 app/store.py      任务状态机、批次提交、断点查询
+app/monitor.py    漂移监测：基准、16 条窗口评估、幂等上报
 app/lease.py      租约获取/续约/围栏校验
 app/model.py      逻辑回归、交叉熵、SGD + 动量
-app/features.py   输入校验与标准化
-app/db.py         SQLite 连接与表结构
-tests/            单元、API、进程级集成测试
+app/features.py   输入校验、标准化、原始样本统计量
+app/db.py         SQLite 连接、表结构与老库迁移
+tests/            单元、API、监测、进程级集成测试
 scripts/demo.py   Swagger 同款接口的端到端演示
-scripts/selftest.py  无 Docker 自检
+scripts/selftest.py  无 Docker 自检（含漂移监测的切换与重启）
 ```

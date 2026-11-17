@@ -31,6 +31,7 @@ from .features import (
     MIN_EPOCHS,
     MOMENTUM,
     InputError,
+    column_stats,
     normalise,
 )
 from .lease import Lease, LeaseLost, owner_ok
@@ -76,6 +77,7 @@ def create_job(
     if not (MIN_EPOCHS <= epochs <= MAX_EPOCHS):
         raise InputError(f"epochs must be between {MIN_EPOCHS} and {MAX_EPOCHS}")
     design, targets = normalise(features, labels)
+    means, stds = column_stats(features)
     feature_dim = int(design.shape[1])
     per_epoch = math.ceil(design.shape[0] / BATCH_SIZE)
     total_steps = per_epoch * epochs
@@ -91,8 +93,9 @@ def create_job(
             INSERT INTO jobs(
                 job_id, status, feature_dim, epochs, batch_size, record_count,
                 total_batches, learning_rate, momentum, features_json, labels_json,
-                weights_json, velocity_json, loss, completed_steps, created_at, updated_at
-            ) VALUES(?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                weights_json, velocity_json, loss, completed_steps, created_at, updated_at,
+                feature_means_json, feature_stds_json
+            ) VALUES(?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -110,6 +113,8 @@ def create_job(
                 initial_loss,
                 now,
                 now,
+                _dumps(means),
+                _dumps(stds),
             ),
         )
         _event(
@@ -173,6 +178,16 @@ def get_job(db_path, job_id: str) -> dict[str, Any] | None:
         "momentum": float(row["momentum"]),
         "loss": float(row["loss"]),
         "evaluation_loss": evaluation_loss,
+        "feature_means": (
+            _loads(row["feature_means_json"]).tolist()
+            if row["feature_means_json"] is not None
+            else None
+        ),
+        "feature_stds": (
+            _loads(row["feature_stds_json"]).tolist()
+            if row["feature_stds_json"] is not None
+            else None
+        ),
         "weights": _loads(row["weights_json"]).tolist(),
         "momentum_velocity": _loads(row["velocity_json"]).tolist(),
         "final_weights": (

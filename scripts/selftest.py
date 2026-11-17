@@ -6,6 +6,9 @@
 2. ``equivalence``: with real worker processes, kill one mid-training and prove
    the finished weights are bit-identical to an uninterrupted run.
 3. ``late``: a frozen (still-running) old worker cannot write after takeover.
+4. ``drift``: the drift-monitoring API - baseline eligibility, window alarms,
+   idempotent retries, partial-window survival across an API restart, and
+   baseline-switch semantics.
 
 Each check prints PASS/FAIL and exits non-zero if anything fails.
 """
@@ -15,10 +18,12 @@ import json
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -85,6 +90,21 @@ def post(port: int, path: str, body: dict):
     )
     with urllib.request.urlopen(request, timeout=10) as response:
         return json.loads(response.read())
+
+
+def post_raw(port: int, path: str, body: dict) -> tuple[int, dict]:
+    """POST that also returns error responses instead of raising."""
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
 
 
 def wait_for(predicate, timeout: float, message: str):
@@ -271,6 +291,89 @@ def check_late_worker(tmp: Path) -> bool:
     return True
 
 
+def check_drift_monitor(tmp: Path) -> bool:
+    db = tmp / "drift.db"
+    api, port = start_api(db)
+    worker = start_worker(db, "drift-worker")
+    try:
+        data_a = dataset(seed=31)
+        job_a = post(port, "/jobs", data_a)
+        completed_state(port, job_a["job_id"])
+
+        # Baseline eligibility: completed + stored raw-sample statistics.
+        baseline = post(port, "/monitor/baseline", {"job_id": job_a["job_id"]})
+        assert baseline["baseline_job_id"] == job_a["job_id"], baseline
+        pending = post(port, "/jobs", dataset(seed=33))
+        code, body = post_raw(port, "/monitor/baseline", {"job_id": pending["job_id"]})
+        assert code == 409 and "completed" in body["detail"], (code, body)
+        legacy = post(port, "/jobs", dataset(seed=34))
+        completed_state(port, legacy["job_id"])
+        # Simulate a job created before drift monitoring existed.
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "UPDATE jobs SET feature_means_json=NULL, feature_stds_json=NULL "
+                "WHERE job_id=?",
+                (legacy["job_id"],),
+            )
+        code, body = post_raw(port, "/monitor/baseline", {"job_id": legacy["job_id"]})
+        assert code == 409 and "statistics" in body["detail"], (code, body)
+
+        # A window shifted by +5 on every column alarms on all four columns,
+        # naming the columns, their offsets and the baseline job.
+        shifted = [[value + 5.0 for value in row] for row in data_a["features"][:16]]
+        result = post(port, "/monitor/readings", {"report_id": "shift-1", "readings": shifted})
+        assert result["window"] == {"window_size": 16, "seq": 1, "filled": 0}, result
+        assert len(result["alarms"]) == 1, result
+        alarm = result["alarms"][0]
+        assert alarm["baseline_job_id"] == job_a["job_id"], alarm
+        assert {c["column"] for c in alarm["columns"]} == {0, 1, 2, 3}, alarm
+        assert all(abs(c["offset"]) > c["threshold"] for c in alarm["columns"]), alarm
+
+        # Retrying the same report does not count twice.
+        retry = post(port, "/monitor/readings", {"report_id": "shift-1", "readings": shifted})
+        assert retry["duplicate"] is True, retry
+        assert get(port, "/monitor/status")["window"] == {"seq": 1, "filled": 0}
+
+        # Five more readings stay pending; an API restart must keep them.
+        calm = data_a["features"][16:21]
+        result = post(port, "/monitor/readings", {"report_id": "calm-1", "readings": calm})
+        assert result["window"]["filled"] == 5, result
+        stop(api)
+        api, port = start_api(db)
+        status = get(port, "/monitor/status")
+        assert status["baseline_job_id"] == job_a["job_id"], status
+        assert status["window"] == {"seq": 1, "filled": 5}, status
+
+        # Switching the baseline discards the partial window...
+        data_b = dataset(seed=32)
+        job_b = post(port, "/jobs", data_b)
+        completed_state(port, job_b["job_id"])
+        switched = post(port, "/monitor/baseline", {"job_id": job_b["job_id"]})
+        assert switched["dropped_readings"] == 5, switched
+        assert get(port, "/monitor/status")["window"] == {"seq": 1, "filled": 0}
+
+        # ...while the already-formed alarm window still points at baseline A.
+        windows = get(port, "/monitor/windows")
+        assert windows[0]["window_seq"] == 1, windows
+        assert windows[0]["baseline_job_id"] == job_a["job_id"], windows
+        assert windows[0]["alarms"], windows
+
+        # Readings near the new baseline raise no alarm.
+        result = post(
+            port, "/monitor/readings", {"report_id": "calm-2", "readings": data_b["features"][:16]}
+        )
+        assert result["alarms"] == [], result
+        assert result["window"] == {"window_size": 16, "seq": 2, "filled": 0}, result
+    finally:
+        stop(worker)
+        stop(api)
+    print(
+        "  PASS: baseline eligibility, 16-reading window alarm with columns/offsets, "
+        "idempotent retry, restart-kept partial window, baseline switch semantics"
+    )
+    return True
+
+
 def main() -> int:
     failures = []
     with tempfile.TemporaryDirectory() as raw:
@@ -279,6 +382,7 @@ def main() -> int:
             ("compose", check_compose),
             ("killed-worker equivalence", lambda: check_equivalence(tmp)),
             ("late-worker fencing", lambda: check_late_worker(tmp)),
+            ("drift monitor", lambda: check_drift_monitor(tmp)),
         ):
             print(f"[{name}]")
             try:

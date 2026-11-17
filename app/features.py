@@ -55,3 +55,15 @@ def normalise(features: list[list[float]], labels: list[int]) -> tuple[np.ndarra
     scaled[:, constant] = 0.0
     design = np.concatenate([scaled, np.ones((scaled.shape[0], 1), dtype=np.float64)], axis=1)
     return design, targets
+
+
+def column_stats(features: list[list[float]]) -> tuple[np.ndarray, np.ndarray]:
+    """Per-column mean and population std of the *raw* submitted sample.
+
+    Call only after :func:`normalise` has validated the input.  The result is
+    persisted with the job and later serves as the drift-monitoring baseline
+    statistics; it is computed from the raw measurements, never reconstructed
+    from the standardised design matrix.
+    """
+    matrix = np.asarray(features, dtype=np.float64)
+    return matrix.mean(axis=0), matrix.std(axis=0)

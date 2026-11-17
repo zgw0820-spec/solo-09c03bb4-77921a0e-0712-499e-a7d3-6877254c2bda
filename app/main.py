@@ -8,7 +8,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import store
+from . import monitor, store
 from .config import Settings
 from .db import init_db, reader
 from .features import InputError
@@ -52,6 +52,40 @@ class TrainingRequest(BaseModel):
         examples=[[0, 0, 1, 1]],
     )
     epochs: int = Field(2, ge=2, le=5, description="Training epochs (2-5).")
+
+
+class BaselineRequest(BaseModel):
+    job_id: str = Field(
+        ...,
+        description=(
+            "Job to use as the drift-monitoring baseline. Must be completed and "
+            "carry raw-sample column statistics (jobs created before drift "
+            "monitoring existed are refused)."
+        ),
+    )
+
+
+class ReadingsRequest(BaseModel):
+    report_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description=(
+            "Client-chosen idempotency key. A retry with the same key returns "
+            "the first response and is never counted twice."
+        ),
+        examples=["shift-2026-11-17-report-0001"],
+    )
+    readings: list[list[float]] = Field(
+        ...,
+        min_length=1,
+        max_length=4096,
+        description=(
+            "Raw vibration/current measurements, one vector per reading, in "
+            "arrival order. Every 16 readings form one non-overlapping window."
+        ),
+        examples=[[[0.12, 3.4], [0.15, 3.5]]],
+    )
 
 
 @app.get("/health", tags=["system"])
@@ -146,3 +180,53 @@ def get_workers() -> dict[str, Any]:
             for row in leases
         ],
     }
+
+
+@app.post("/monitor/baseline", tags=["monitor"])
+def set_monitor_baseline(request: BaselineRequest) -> dict[str, Any]:
+    """Set the drift-monitoring baseline to a completed job.
+
+    The job must have finished training and carry the raw-sample column
+    statistics saved at submission.  Switching to a different baseline
+    discards the partially filled window; already evaluated windows keep
+    pointing at the baseline that formed them.
+    """
+    try:
+        return monitor.set_baseline(settings.db_path, request.job_id)
+    except store.JobNotFound as exc:
+        raise HTTPException(status_code=404, detail="job not found") from exc
+    except monitor.BaselineNotEligible as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/monitor/status", tags=["monitor"])
+def monitor_status() -> dict[str, Any]:
+    """Current baseline and how full the not-yet-evaluated window is."""
+    return monitor.get_status(settings.db_path)
+
+
+@app.post("/monitor/readings", tags=["monitor"])
+def submit_monitor_readings(request: ReadingsRequest) -> dict[str, Any]:
+    """Report raw measurements, one vector per reading.
+
+    Every 16 readings form one non-overlapping window.  When a window fills,
+    its per-column means are compared with the baseline: a column alarms when
+    the mean moved by more than two baseline standard deviations, and a
+    baseline-constant column alarms on any differing reading.  The response
+    lists, per alarmed window, the alarmed columns, their offsets and the
+    baseline job id.  Retrying with the same ``report_id`` never counts twice.
+    """
+    try:
+        return monitor.submit_readings(
+            settings.db_path, request.report_id, request.readings
+        )
+    except monitor.NoBaseline as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except monitor.BadReading as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/monitor/windows", tags=["monitor"])
+def monitor_windows(limit: int = Query(100, ge=1, le=1000)) -> list[dict[str, Any]]:
+    """Evaluated windows, newest first; each keeps the baseline that formed it."""
+    return monitor.list_windows(settings.db_path, limit)

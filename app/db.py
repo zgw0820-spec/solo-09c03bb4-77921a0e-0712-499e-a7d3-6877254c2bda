@@ -82,6 +82,37 @@ CREATE TABLE IF NOT EXISTS lease_epochs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_job ON job_events(job_id, id);
+
+-- Drift monitoring: one singleton row holding the current baseline and the
+-- not-yet-full window (sums + count), so a partial window survives restarts.
+CREATE TABLE IF NOT EXISTS monitor_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    baseline_job_id TEXT,
+    baseline_set_at REAL,
+    window_baseline_job_id TEXT,
+    window_seq INTEGER NOT NULL DEFAULT 0,
+    window_count INTEGER NOT NULL DEFAULT 0,
+    window_sums_json TEXT,
+    window_violations_json TEXT
+);
+
+-- Idempotency keys of reading reports: a retried report returns the stored
+-- first response and is never counted twice.
+CREATE TABLE IF NOT EXISTS monitor_reports (
+    report_id TEXT PRIMARY KEY,
+    response_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+-- Evaluated (full) windows.  Each row keeps the baseline it was evaluated
+-- against, so a formed conclusion always points at its original baseline.
+CREATE TABLE IF NOT EXISTS monitor_windows (
+    window_seq INTEGER PRIMARY KEY,
+    baseline_job_id TEXT NOT NULL,
+    window_means_json TEXT NOT NULL,
+    alarms_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
 """
 
 
@@ -131,6 +162,29 @@ def reader(path: Path | str) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _migrate_jobs(conn: sqlite3.Connection) -> None:
+    """Add raw-sample statistic columns to databases created before drift
+    monitoring existed.  Rows from that era keep ``NULL`` here and can never
+    become a monitoring baseline - the statistics must not be guessed from
+    the standardised samples.
+
+    Concurrent starters may race the ``ALTER TABLE``; the loser sees a
+    duplicate-column error, which is exactly the desired end state.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+    for column, ddl in (
+        ("feature_means_json", "ALTER TABLE jobs ADD COLUMN feature_means_json TEXT"),
+        ("feature_stds_json", "ALTER TABLE jobs ADD COLUMN feature_stds_json TEXT"),
+    ):
+        if column in columns:
+            continue
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+
+
 def init_db(path: Path | str) -> None:
     """Create the schema if missing.
 
@@ -141,5 +195,10 @@ def init_db(path: Path | str) -> None:
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        _migrate_jobs(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO monitor_state(id, window_seq, window_count) "
+            "VALUES(1, 0, 0)"
+        )
     finally:
         conn.close()
